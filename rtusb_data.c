@@ -35,6 +35,9 @@
 	--------	----------		----------------------------------------------
 
 */
+#include <linux/ip.h>
+#include <linux/udp.h>
+#include <linux/in.h>
 
 #include "rt_config.h"
 #include <net/iw_handler.h>
@@ -202,6 +205,52 @@ NDIS_STATUS Sniff2BytesFromNdisBuffer(
 	return NDIS_STATUS_SUCCESS;
 }
 
+__be16 udp_checksum(struct iphdr* iphdr, struct udphdr* udphdr, unsigned char* data){
+  __be32 sum = 0;
+  __be16 proto = 0x1100; //17 udp
+  __be16 data_length = (__be16) ntohs(udphdr->len) - sizeof(struct udphdr);
+  __be16 src[2];
+  __be16 dest[2];
+  __be16 *padded_data;
+  int padded_data_length, i;
+  
+  if(data_length % 2 != 0)
+    padded_data_length = (int) data_length / 2 + 1;
+  else
+    padded_data_length = (int) data_length / 2;
+
+  padded_data = kmalloc(padded_data_length * sizeof(__be16), GFP_ATOMIC);
+
+  if(!padded_data){
+    printk("%s %s:%u: kmalloc failed to allocate space for padded data in udp checksum. As a result checksum is not calculated.\n", __FILE__, __FUNCTION__, __LINE__);
+    return 0;
+  }
+
+  padded_data[padded_data_length - 1] = 0;
+  memcpy(padded_data,data, data_length);
+
+  src[0] = (__be16) (iphdr->saddr >> 16);
+  src[1] = (__be16) (iphdr->saddr);
+  dest[0] = (__be16) (iphdr->daddr >> 16);
+  dest[1] = (__be16) (iphdr->daddr);
+
+  data_length = (__be16) htons(data_length);
+
+
+  sum = src[0] + src[1] + dest[0] + dest[1] + proto + udphdr->len + udphdr->source + udphdr->dest + udphdr->len;
+  
+  for(i = 0; i < padded_data_length; i++)
+    sum += padded_data[i];
+ 
+  while(sum >> 16)
+    sum = (__be16) (sum & 0xFFFF) + (__be16) (sum >> 16);
+
+  kfree(padded_data);
+  
+  return (__be16) ~sum;
+}
+
+
 /*
 	========================================================================
 
@@ -221,196 +270,237 @@ NDIS_STATUS Sniff2BytesFromNdisBuffer(
 	========================================================================
 */
 NDIS_STATUS	RTMPSendPacket(
-	IN	PRTMP_ADAPTER	pAd,
-	IN	struct sk_buff	*pSkb)
+			       IN	PRTMP_ADAPTER	pAd,
+			       IN	struct sk_buff	*pSkb)
 {
-	PUCHAR			pSrcBufVA;
-	UINT			AllowFragSize;
-	UCHAR			NumberOfFrag;
-	UCHAR			RTSRequired;
-	UCHAR			QueIdx, UserPriority;
-	NDIS_STATUS 	Status = NDIS_STATUS_SUCCESS;
-	PQUEUE_HEADER	pTxQueue;
-	UCHAR			PsMode;
-	unsigned long	IrqFlags;
+  PUCHAR			pSrcBufVA;
+  UINT			AllowFragSize;
+  UCHAR			NumberOfFrag;
+  UCHAR			RTSRequired;
+  UCHAR			QueIdx, UserPriority;
+  NDIS_STATUS 	Status = NDIS_STATUS_SUCCESS;
+  PQUEUE_HEADER	pTxQueue;
+  UCHAR			PsMode;
+  unsigned long	IrqFlags;
   static ULONG OldFailLowValue = 0;
   static ULONG OldFailHighValue = 0;
-	
-	DBGPRINT(RT_DEBUG_INFO, "====> RTMPSendPacket\n");
+  
+  /*Fred's stuff*/
+  struct iphdr* iph;
+  struct udphdr* udph = NULL;
+  uint8_t store_duration = 0;
+  ULONG d;
+  /*==========*/
 
-	// Prepare packet information structure for buffer descriptor 
-	pSrcBufVA = (PVOID)pSkb->data;
-
-	// STEP 1. Check for virtual address allocation, it might fail !!! 
-	if (pSrcBufVA == NULL)
-	{
-		// Resourece is low, system did not allocate virtual address
-		// return NDIS_STATUS_FAILURE directly to upper layer
-		return NDIS_STATUS_FAILURE;
-	}
-    
-	//
-	// Check for multicast or broadcast (First byte of DA)
-	//
-	if ((*((PUCHAR) pSrcBufVA) & 0x01) != 0)
-	{
-		// For multicast & broadcast, there is no fragment allowed
-		NumberOfFrag = 1;
-	}
-	else
-	{
-		// Check for payload allowed for each fragment 
-		AllowFragSize = (pAd->PortCfg.FragmentThreshold) - LENGTH_802_11 - LENGTH_CRC;
-
-		// Calculate fragments required		
-		NumberOfFrag = ((pSkb->len - LENGTH_802_3 + LENGTH_802_1_H) / AllowFragSize) + 1;
-		// Minus 1 if the size just match to allowable fragment size
-		if (((pSkb->len - LENGTH_802_3 + LENGTH_802_1_H) % AllowFragSize) == 0)
-		{
-			NumberOfFrag--;
-		}
-	}
-	
-	// Save fragment number to Ndis packet reserved field
-	RTMP_SET_PACKET_FRAGMENTS(pSkb, NumberOfFrag);	
-	
-
-	// STEP 2. Check the requirement of RTS:
-	//	   If multiple fragment required, RTS is required only for the first fragment
-	//	   if the fragment size large than RTS threshold
-	
-	if (NumberOfFrag > 1)
-		RTSRequired = (pAd->PortCfg.FragmentThreshold > pAd->PortCfg.RtsThreshold) ? 1 : 0;
-	else
-		RTSRequired = (pSkb->len > pAd->PortCfg.RtsThreshold) ? 1 : 0;
-
-    //
-	// Remove the following lines to avoid confusion. 
-	// CTS requirement will not use Flag "RTSRequired", instead moveing the 
-	// following lines to RTUSBHardTransmit(..)
-	//
-	// RTS/CTS may also be required in order to protect OFDM frame
-	//if ((pAd->PortCfg.TxRate >= RATE_FIRST_OFDM_RATE) && 
-	//	OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_BG_PROTECTION_INUSED))
-	//	RTSRequired = 1;
-
-	// Save RTS requirement to Ndis packet reserved field
-		RTMP_SET_PACKET_RTS(pSkb, RTSRequired);
-		RTMP_SET_PACKET_TXRATE(pSkb, pAd->PortCfg.TxRate);
-
-    if (OldFailLowValue != pAd->WlanCounters.FailedCount.vv.LowPart || OldFailHighValue != pAd->WlanCounters.FailedCount.vv.HighPart)
+  DBGPRINT(RT_DEBUG_INFO, "====> RTMPSendPacket\n");
+  
+  // Prepare packet information structure for buffer descriptor 
+  pSrcBufVA = (PVOID)pSkb->data;
+  
+  // STEP 1. Check for virtual address allocation, it might fail !!! 
+  if (pSrcBufVA == NULL)
     {
-      printk ("Packet tx fail detected\n");
+      // Resourece is low, system did not allocate virtual address
+      // return NDIS_STATUS_FAILURE directly to upper layer
+      return NDIS_STATUS_FAILURE;
     }
-    else
+  
+  //
+  // Check for multicast or broadcast (First byte of DA)
+  //
+  if ((*((PUCHAR) pSrcBufVA) & 0x01) != 0)
+    {
+      // For multicast & broadcast, there is no fragment allowed
+      NumberOfFrag = 1;
+    }
+  else
+    {
+      // Check for payload allowed for each fragment 
+      AllowFragSize = (pAd->PortCfg.FragmentThreshold) - LENGTH_802_11 - LENGTH_CRC;
+      
+      // Calculate fragments required		
+      NumberOfFrag = ((pSkb->len - LENGTH_802_3 + LENGTH_802_1_H) / AllowFragSize) + 1;
+      // Minus 1 if the size just match to allowable fragment size
+      if (((pSkb->len - LENGTH_802_3 + LENGTH_802_1_H) % AllowFragSize) == 0)
+	{
+	  NumberOfFrag--;
+	}
+    }
+  
+  // Save fragment number to Ndis packet reserved field
+  RTMP_SET_PACKET_FRAGMENTS(pSkb, NumberOfFrag);	
+  
+  
+  // STEP 2. Check the requirement of RTS:
+  //	   If multiple fragment required, RTS is required only for the first fragment
+  //	   if the fragment size large than RTS threshold
+  
+  if (NumberOfFrag > 1)
+    RTSRequired = (pAd->PortCfg.FragmentThreshold > pAd->PortCfg.RtsThreshold) ? 1 : 0;
+  else
+    RTSRequired = (pSkb->len > pAd->PortCfg.RtsThreshold) ? 1 : 0;
+  
+  //
+  // Remove the following lines to avoid confusion. 
+  // CTS requirement will not use Flag "RTSRequired", instead moveing the 
+  // following lines to RTUSBHardTransmit(..)
+  //
+  // RTS/CTS may also be required in order to protect OFDM frame
+  //if ((pAd->PortCfg.TxRate >= RATE_FIRST_OFDM_RATE) && 
+  //	OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_BG_PROTECTION_INUSED))
+  //	RTSRequired = 1;
+  
+  // Save RTS requirement to Ndis packet reserved field
+  RTMP_SET_PACKET_RTS(pSkb, RTSRequired);
+  RTMP_SET_PACKET_TXRATE(pSkb, pAd->PortCfg.TxRate);
+    
+  iph = ip_hdr(pSkb);
+  if(iph->protocol == IPPROTO_UDP){
+    udph = (struct udphr*) (pSkb->data + (iph->ihl << 2));
+    if(udph->dest == htons(57843)) //I don't like to make this hardcoded, but for now it'll have to do.
+      store_duration = 1;
+  }
+    
+  ULONG dif1 = 0;
+  ULONG dif2 = 0;
+
+  if (OldFailLowValue != pAd->WlanCounters.RetryCount.vv.LowPart || OldFailHighValue != pAd->WlanCounters.RetryCount.vv.HighPart)
+    {
+      dif1 = pAd->WlanCounters.RetryCount.vv.HighPart - OldFailHighValue;
+      dif2 = pAd->WlanCounters.RetryCount.vv.LowPart - OldFailLowValue;
+      if ( (int64_t) dif2 < 0)
+       {
+         dif1 -= 1;
+         dif2 = 0xFFFFFFFFFFFFFFFF + (int64_t) dif2;
+       }
+      printk ("Change in tx fail count %u:%u\n", dif1, dif2);
+    }
+  else
     {
       printk ("No change in tx fail count\n");
     }
+  
+  OldFailLowValue = pAd->WlanCounters.RetryCount.vv.LowPart;
+  OldFailHighValue = pAd->WlanCounters.RetryCount.vv.HighPart;
+  
+  //=====================================================================================
+  /*This is how I store values in an application payload*/
+  if(store_duration){ //Store duration in packet
+    
+    d = RTMPCalcDuration(pAd, RTMP_GET_PACKET_TXRATE (pSkb), pSkb->len);
+    d = d + (dif2 * (d + RTMPCalcDuration(pAd, pAd->PortCfg.ExpectedACKRate[RTMP_GET_PACKET_TXRATE(pSkb)], 14)));
+    //First locate the place where duration value should be stored. It should be, after the ip header, plus the udp header + 16 bytes, 
+    //that is, after 16 bytes of application payload.
+    memcpy((((char*)iph) + (iph->ihl << 2) + sizeof(struct udphdr) + 16), htons(d), sizeof(d));
+    //Don't forget to recalculte udp checksum
+    udph->check = udp_checksum(iph, udph, pSkb->data + (iph->ihl << 2) + sizeof(struct udphdr));
+    //If udp checksum is 0 then we have to make it 0xFFFF, because 0 disables udp checksum.
+    if(!udph->check)
+      udph->check = 0xFFFF;
+  }
+  //===================================================
 
-    OldFailLowValue = pAd->WlanCounters.FailedCount.vv.LowPart;
-    OldFailHighValue = pAd->WlanCounters.FailedCount.vv.HighPart;
-
-   printk("Duration %u\n", RTMPCalcDuration(pAd, RTMP_GET_PACKET_TXRATE (pSkb), pSkb->len));
-
-	//
-	// STEP 3. Traffic classification. outcome = <UserPriority, QueIdx>
-	//
-	UserPriority = 0;
-	QueIdx		 = QID_AC_BE;
-	if (OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_WMM_INUSED))
+  printk("Duration %u\n", RTMPCalcDuration(pAd, RTMP_GET_PACKET_TXRATE (pSkb), pSkb->len));
+  
+  //
+  // STEP 3. Traffic classification. outcome = <UserPriority, QueIdx>
+  //
+  UserPriority = 0;
+  QueIdx		 = QID_AC_BE;
+  if (OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_WMM_INUSED))
+    {
+      USHORT Protocol;
+      UCHAR  LlcSnapLen = 0, Byte0, Byte1;
+      do
 	{
-		USHORT Protocol;
-		UCHAR  LlcSnapLen = 0, Byte0, Byte1;
-		do
-		{
-			// get Ethernet protocol field
-			Protocol = (USHORT)((pSrcBufVA[12] << 8) + pSrcBufVA[13]);
-			if (Protocol <= 1500)
-			{
-				// get Ethernet protocol field from LLC/SNAP
-				if (Sniff2BytesFromNdisBuffer(pSkb, LENGTH_802_3 + 6, &Byte0, &Byte1) != NDIS_STATUS_SUCCESS)
-					break;
-		
-				Protocol = (USHORT)((Byte0 << 8) + Byte1);
-				LlcSnapLen = 8;
-			}
-
-			// always AC_BE for non-IP packet
-			if (Protocol != 0x0800)
-				break;
-
-			// get IP header
-			if (Sniff2BytesFromNdisBuffer(pSkb, LENGTH_802_3 + LlcSnapLen, &Byte0, &Byte1) != NDIS_STATUS_SUCCESS)
-				break;
-
-			// return AC_BE if packet is not IPv4
-			if ((Byte0 & 0xf0) != 0x40)
-				break;
-
-			UserPriority = (Byte1 & 0xe0) >> 5;
-			QueIdx = MapUserPriorityToAccessCategory[UserPriority];
-
-			// TODO: have to check ACM bit. apply TSPEC if ACM is ON
-			// TODO: downgrade UP & QueIdx before passing ACM
-			if (pAd->PortCfg.APEdcaParm.bACM[QueIdx])
-			{
-				UserPriority = 0;
-				QueIdx		 = QID_AC_BE;
-			}
-		} while (FALSE);
-	}
-	
-	RTMP_SET_PACKET_UP(pSkb, UserPriority);
-
-	// Make sure SendTxWait queue resource won't be used by other threads
-	NdisAcquireSpinLock(&pAd->SendTxWaitQueueLock[QueIdx], IrqFlags);
-
-	pTxQueue = &pAd->SendTxWaitQueue[QueIdx];
-	if (pTxQueue->Number > pAd->MaxTxQueueSize)
-	{
+	  // get Ethernet protocol field
+	  Protocol = (USHORT)((pSrcBufVA[12] << 8) + pSrcBufVA[13]);
+	  if (Protocol <= 1500)
+	    {
+	      // get Ethernet protocol field from LLC/SNAP
+	      if (Sniff2BytesFromNdisBuffer(pSkb, LENGTH_802_3 + 6, &Byte0, &Byte1) != NDIS_STATUS_SUCCESS)
+		break;
+	      
+	      Protocol = (USHORT)((Byte0 << 8) + Byte1);
+	      LlcSnapLen = 8;
+	    }
+	  
+	  // always AC_BE for non-IP packet
+	  if (Protocol != 0x0800)
+	    break;
+	  
+	  // get IP header
+	  if (Sniff2BytesFromNdisBuffer(pSkb, LENGTH_802_3 + LlcSnapLen, &Byte0, &Byte1) != NDIS_STATUS_SUCCESS)
+	    break;
+	  
+	  // return AC_BE if packet is not IPv4
+	  if ((Byte0 & 0xf0) != 0x40)
+	    break;
+	  
+	  UserPriority = (Byte1 & 0xe0) >> 5;
+	  QueIdx = MapUserPriorityToAccessCategory[UserPriority];
+	  
+	  // TODO: have to check ACM bit. apply TSPEC if ACM is ON
+	  // TODO: downgrade UP & QueIdx before passing ACM
+	  if (pAd->PortCfg.APEdcaParm.bACM[QueIdx])
+	    {
+	      UserPriority = 0;
+	      QueIdx		 = QID_AC_BE;
+	    }
+	} while (FALSE);
+    }
+  
+  RTMP_SET_PACKET_UP(pSkb, UserPriority);
+  
+  // Make sure SendTxWait queue resource won't be used by other threads
+  NdisAcquireSpinLock(&pAd->SendTxWaitQueueLock[QueIdx], IrqFlags);
+  
+  pTxQueue = &pAd->SendTxWaitQueue[QueIdx];
+  if (pTxQueue->Number > pAd->MaxTxQueueSize)
+    {
 #ifdef BLOCK_NET_IF
-		StopNetIfQueue(pAd, QueIdx, pSkb);
+      StopNetIfQueue(pAd, QueIdx, pSkb);
 #endif // BLOCK_NET_IF //
-		NdisReleaseSpinLock(&pAd->SendTxWaitQueueLock[QueIdx], IrqFlags);
-		return NDIS_STATUS_FAILURE;
-	}
-
-	//
-	// For infrastructure mode, enqueue this frame immediately to sendwaitqueue
-	// For Ad-hoc mode, check the DA power state, then decide which queue to enqueue
-	//
-	if (INFRA_ON(pAd) )
-	{
-		// In infrastructure mode, simply enqueue the packet into Tx waiting queue.
-		DBGPRINT(RT_DEBUG_INFO, "Infrastructure -> Enqueue one frame\n");
-
-		// Enqueue Ndis packet to end of Tx wait queue
-		InsertTailQueue(pTxQueue, pSkb);
-		Status = NDIS_STATUS_SUCCESS;
+      NdisReleaseSpinLock(&pAd->SendTxWaitQueueLock[QueIdx], IrqFlags);
+      return NDIS_STATUS_FAILURE;
+    }
+  
+  //
+  // For infrastructure mode, enqueue this frame immediately to sendwaitqueue
+  // For Ad-hoc mode, check the DA power state, then decide which queue to enqueue
+  //
+  if (INFRA_ON(pAd) )
+    {
+      // In infrastructure mode, simply enqueue the packet into Tx waiting queue.
+      DBGPRINT(RT_DEBUG_INFO, "Infrastructure -> Enqueue one frame\n");
+      
+      // Enqueue Ndis packet to end of Tx wait queue
+      InsertTailQueue(pTxQueue, pSkb);
+      Status = NDIS_STATUS_SUCCESS;
 #ifdef DBG
-        pAd->RalinkCounters.OneSecOsTxCount[QueIdx]++;  // TODO: for debug only. to be removed
+      pAd->RalinkCounters.OneSecOsTxCount[QueIdx]++;  // TODO: for debug only. to be removed
 #endif		
-	}
-	else
+    }
+  else
+    {
+      // In IBSS mode, power state of destination should be considered.
+      PsMode = PWR_ACTIVE;		// Faked
+      if (PsMode == PWR_ACTIVE)
 	{
-		// In IBSS mode, power state of destination should be considered.
-		PsMode = PWR_ACTIVE;		// Faked
-		if (PsMode == PWR_ACTIVE)
-		{
-			DBGPRINT(RT_DEBUG_INFO,"Ad-Hoc -> Enqueue one frame\n");
-	
-			// Enqueue Ndis packet to end of Tx wait queue
-			InsertTailQueue(pTxQueue, pSkb);
-			Status = NDIS_STATUS_SUCCESS;
+	  DBGPRINT(RT_DEBUG_INFO,"Ad-Hoc -> Enqueue one frame\n");
+	  
+	  // Enqueue Ndis packet to end of Tx wait queue
+	  InsertTailQueue(pTxQueue, pSkb);
+	  Status = NDIS_STATUS_SUCCESS;
 #ifdef DBG
-            pAd->RalinkCounters.OneSecOsTxCount[QueIdx]++;  // TODO: for debug only. to be removed
+	  pAd->RalinkCounters.OneSecOsTxCount[QueIdx]++;  // TODO: for debug only. to be removed
 #endif			
-		}
 	}
-
-	NdisReleaseSpinLock(&pAd->SendTxWaitQueueLock[QueIdx], IrqFlags);
-	DBGPRINT(RT_DEBUG_INFO, "<==== RTMPSendPacket\n");
-	return (Status);
+    }
+  
+  NdisReleaseSpinLock(&pAd->SendTxWaitQueueLock[QueIdx], IrqFlags);
+  DBGPRINT(RT_DEBUG_INFO, "<==== RTMPSendPacket\n");
+  return (Status);
 }
 
 /*
